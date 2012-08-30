@@ -1,6 +1,8 @@
 var net = require('net'),
     events = require('events'),
-    _ = require("underscore");
+    _ = require("underscore"),
+    game = require("./game-interface.js"),
+    ch = require("./command-helper.js");
 
 
 var lobby = new events.EventEmitter();
@@ -15,6 +17,12 @@ lobby.on('join', function (id, client) {
             client.write(message);
         }
     });
+
+    this.on('leave', function (id) {
+        this.players[id] = undefined;
+        this.emit('broadcast', id, id + " has left the lobby.\n");
+    });
+
 });
 
 
@@ -26,9 +34,13 @@ var server = net.createServer(function (client) {
     });
 
     client.on('data', function (data) {
-        var request = parseRequest(data);
+        var request = ch.parseRequest(data);
         respond(client, request);
     });
+    client.on('close', function () {
+        lobby.emit('leave', id);
+    });
+
 });
 
 server.listen(8888);
@@ -36,11 +48,14 @@ server.listen(8888);
 
 var commands = {
     ls:function (client) {
-        client.write(JSON.stringify({players:
-            _.filter(_.pluck(lobby.players, "playerId"), function (p) {
-                return p !== client.playerId;
-            })
-        }));
+        ch.send(client, {players:_.filter(_.pluck(lobby.players, "playerId"), function (p) {
+            return p !== client.playerId;
+        })
+        });
+    },
+    setName:function (player, name) {
+        player.playerName = name;
+        ch.send(player, {success:true});
     },
     challenge:function (client, playerId) {
 
@@ -49,18 +64,20 @@ var commands = {
 
         challengingPlayer.challenge = playerId; //one challenge at a time
 
-        challengedPlayer.write(JSON.stringify({challenge:challengedPlayer.playerId}));
-        client.write(JSON.stringify({success:true}));
+        ch.send(challengedPlayer, {challenge:challengingPlayer.playerId});
+        ch.send(challengingPlayer, {success:true});
     },
     deny:function (client, playerId) {
         var challengingPlayer = lobby.players[playerId];
         var challengedPlayer = client;
 
         if (challengingPlayer.challenge === challengedPlayer.playerId) {
-            challengingPlayer.write(JSON.stringify({accept:false}));
-            client.write(JSON.stringify({success:"Challenge denied"}));
+            ch.send(challengingPlayer, {accept:false});
+            challengingPlayer.challenge = undefined;
+
+            ch.send(challengedPlayer, {success:"Challenge denied"});
         } else {
-            client.write(JSON.stringify({error:"No challenge from that player exists"}));
+            ch.send(challengedPlayer, {error:"No challenge from that player exists"});
         }
     },
     accept:function (client, playerId) {
@@ -68,33 +85,30 @@ var commands = {
         var challengedPlayer = client;
 
         if (challengingPlayer.challenge === challengedPlayer.playerId) {
-            challengingPlayer.write(JSON.stringify({accept:true}));
-            client.write(JSON.stringify({success:"Challenge accepted"}));
+            ch.send(challengingPlayer, {accept:true});
+            ch.send(challengedPlayer, {success:"Challenge accepted"});
+
+            challengedPlayer.removeAllListeners();
+            challengingPlayer.removeAllListeners();
+
+            game.startGame(challengedPlayer, challengingPlayer, function () {
+
+                lobby.emit('join', challengedPlayer.playerId, challengedPlayer);
+                lobby.emit('join', challengingPlayer.playerId, challengingPlayer);
+            });
+
         } else {
-            client.write(JSON.stringify({error:"No challenge from that player exists"}));
+            ch.send(client, {error:"No challenge from that player exists"});
         }
+
+
     },
     error:function (client) {
-        client.write(JSON.stringify({error:"No such command"}));
+        ch.send(client, {error:"No such command"});
     }
 };
 
 function respond(client, request) {
-    commands[request.command].apply(null, [client].concat(request.params));
-}
-
-function parseRequest(data) {
-
-    var stri = data.toString().trim(),
-        request = JSON.parse(stri);
-
-    if (request.command && request.command !== "") {
-        if(!request.params){
-            request.params = [];
-        }
-        return request;
-    } else {
-        return {command:"error", params:[]};
-    }
-
+    var command = commands[request.command] || commands.error;
+    command.apply(null, [client].concat(request.params));
 }
